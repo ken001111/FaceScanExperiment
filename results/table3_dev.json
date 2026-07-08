@@ -1,0 +1,32 @@
+[
+  {
+    "init": "sfm",
+    "mesh": "Face_Mesh_MetricScale_ken_sfm_nn.ply",
+    "init_pts": "15853",
+    "final_pts": "75294",
+    "rms": 6.184,
+    "chamfer": 5.431,
+    "f1mm": 0.096,
+    "pct1mm": 22.9
+  },
+  {
+    "init": "random",
+    "mesh": "Face_Mesh_MetricScale_ken_random_nn.ply",
+    "init_pts": "100000",
+    "final_pts": "68786",
+    "rms": 7.324,
+    "chamfer": 7.289,
+    "f1mm": 0.065,
+    "pct1mm": 16.1
+  },
+  {
+    "init": "lidar",
+    "mesh": "Face_Mesh_MetricScale_ken_lidar_nn.ply",
+    "init_pts": "54937",
+    "final_pts": "68161",
+    "rms": 6.537,
+    "chamfer": 6.654,
+    "f1mm": 0.075,
+    "pct1mm": 18.5
+  }
+]
