@@ -165,7 +165,7 @@ pre {{ background:var(--card); border:1px solid var(--line); border-radius:6px; 
 .stat span {{ font-size:12px; color:var(--mut); text-transform:uppercase; letter-spacing:.05em }}
 </style>
 <main>
-<div class="kicker">FaceScan research campaign · living inventory · v2 (2026-07-07)</div>
+<div class="kicker">FaceScan research campaign · living inventory · v3 (2026-07-08)</div>
 <h1>Everything we made: data inventory &amp; results</h1>
 <p>Four reconstruction methods, three datasets, one benchmark, and a parameter study —
 every mesh, table, and preview produced, with paths to find them. This document grows
@@ -179,6 +179,37 @@ masking / matte arms are deprecated (they impede cross-method comparability).</p
 <div class="stat"><b>3</b><span>init-study arms</span></div>
 <div class="stat"><b>1</b><span>validated metric library</span></div>
 </div>
+
+<h2>0 · Plan — placeholders fill as results land</h2>
+<p class="sub">Structure first, numbers second. Each [ · ] becomes a value when the run completes.</p>
+
+<h2>Paper B — depth-source ablation (the headline)</h2>
+<p class="sub">GeoSVR fork on ARKitScenes scene 47331963 (+ scene 2 TBD), scored vs Faro laser GT
+with the validated §0 library. Raw frames throughout (no masking).</p>
+<div class="tablewrap"><table>
+<tr><th>Depth source</th><th>Accuracy ↓</th><th>Completeness ↓</th><th>Chamfer ↓</th><th>F@2cm ↑</th><th>PSNR ↑</th><th>Status</th></tr>
+<tr><td>No depth term</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td><span class="chip warn">planned</span></td></tr>
+<tr><td>Monocular (GeoSVR default, DepthAnythingV2)</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td><span class="chip warn">planned — baseline</span></td></tr>
+<tr><td><b>Measured LiDAR (ours)</b></td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td><span class="chip warn">fork: LidarDepthLoss designed</span></td></tr>
+<tr><td><b>Measured LiDAR + confidence (ours)</b></td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td><span class="chip warn">fork: after LiDAR arm</span></td></tr>
+</table></div>
+
+<h2>Paper B — voxel-init ablation</h2>
+<div class="tablewrap"><table>
+<tr><th>Init</th><th>Chamfer ↓</th><th>#Voxels</th><th>Train time</th><th>Status</th></tr>
+<tr><td>Default (uniform grid)</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td><span class="chip warn">planned</span></td></tr>
+<tr><td><b>LiDAR-seeded (ours)</b></td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td class="dim">[ · ]</td><td><span class="chip warn">planned</span></td></tr>
+</table></div>
+
+<h2>Paper A — remaining placeholders</h2>
+<div class="tablewrap"><table>
+<tr><th>Item</th><th>Blocks on</th><th>Status</th></tr>
+<tr><td>Depth-supervision arm (H1) via HEIC-embedded depth</td><td>depth extractor (code)</td><td><span class="chip warn">unblocked — depth confirmed in HEICs</span></td></tr>
+<tr><td>Tables 1–2 absolute (frame vs CAD, face vs Artec)</td><td>Artec-paired specimens</td><td><span class="chip warn">awaiting data</span></td></tr>
+<tr><td>Table 3 definitive init ranking</td><td>Artec-paired specimens</td><td><span class="chip warn">harness ready, proxy numbers below</span></td></tr>
+<tr><td>Per-vertex error heatmap figures (turbo, 0–5 mm)</td><td>—</td><td><span class="chip warn">next code task</span></td></tr>
+<tr><td>ScanNet++ extension</td><td>DUA signature (user)</td><td><span class="chip fail">user action</span></td></tr>
+</table></div>
 
 <h2>1 · DTU benchmark — every method reproduces its paper</h2>
 <p class="sub">Chamfer ↓ (mm), official per-method protocols and evaluators. Files: <code>~/FaceScan/bench/</code></p>
