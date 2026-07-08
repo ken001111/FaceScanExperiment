@@ -1,0 +1,659 @@
+From 28af0cde7b0ffb47e83374c62cfec3addaf3b715 Mon Sep 17 00:00:00 2001
+From: ken001111 <ken001111@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 12:24:28 -0500
+Subject: [PATCH 1/3] LiDAR measured-depth supervision: MetricLidarDepthLoss
+ (user) + adapter, config, loader plumbing
+
+---
+ mesh_extract/tsdf_mesh_band.py        | 216 ++++++++++++++++++++++++++
+ src/config.py                         |   4 +
+ src/dataloader/colmap_loader.py       |  11 +-
+ src/dataloader/data_pack.py           |  15 +-
+ src/dataloader/reader_nerf_dataset.py |   7 +-
+ src/dataloader/reader_scene_info.py   |   2 +
+ src/utils/bounding_utils.py           |   7 +-
+ src/utils/lidar_depth_loss.py         |  87 +++++++++++
+ src/utils/octree_utils.py             |   2 +
+ train.py                              |  11 +-
+ 10 files changed, 353 insertions(+), 9 deletions(-)
+ create mode 100644 mesh_extract/tsdf_mesh_band.py
+ create mode 100644 src/utils/lidar_depth_loss.py
+
+diff --git a/mesh_extract/tsdf_mesh_band.py b/mesh_extract/tsdf_mesh_band.py
+new file mode 100644
+index 0000000..866425d
+--- /dev/null
++++ b/mesh_extract/tsdf_mesh_band.py
+@@ -0,0 +1,216 @@
++#
++# Copyright (C) 2023, Inria
++# GRAPHDECO research group, https://team.inria.fr/graphdeco
++# All rights reserved.
++#
++# This software is free for non-commercial, research and evaluation use 
++# under the terms of the LICENSE.md file.
++#
++# For inquiries contact  george.drettakis@inria.fr
++#
++
++# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
++#
++# NVIDIA CORPORATION and its licensors retain all intellectual property
++# and proprietary rights in and to this software, related documentation
++# and any modifications thereto.  Any use, reproduction, disclosure or
++# distribution of this software and related documentation without an express
++# license agreement from NVIDIA CORPORATION is strictly prohibited.
++
++import os
++import time
++import numpy as np
++from tqdm import tqdm
++from os import makedirs
++import imageio
++import open3d as o3d
++import torch
++
++from src.config import cfg, update_argparser, update_config
++
++from src.dataloader.data_pack import DataPack
++from src.sparse_voxel_model import SparseVoxelModel
++from src.utils.image_utils import im_tensor2np, viz_tensordepth
++
++
++def clean_mesh(mesh, min_len=1000):
++    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
++        triangle_clusters, cluster_n_triangles, cluster_area = (mesh.cluster_connected_triangles())
++    triangle_clusters = np.asarray(triangle_clusters)
++    cluster_n_triangles = np.asarray(cluster_n_triangles)
++    cluster_area = np.asarray(cluster_area)
++    triangles_to_remove = cluster_n_triangles[triangle_clusters] < min_len
++    mesh_0 = copy.deepcopy(mesh)
++    mesh_0.remove_triangles_by_mask(triangles_to_remove)
++    return mesh_0
++
++def post_process_mesh(mesh, cluster_to_keep=1):
++    """
++    Post-process a mesh to filter out floaters and disconnected parts
++    """
++    import copy
++    print("post processing the mesh to have {} clusterscluster_to_kep".format(cluster_to_keep))
++    mesh_0 = copy.deepcopy(mesh)
++    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
++            triangle_clusters, cluster_n_triangles, cluster_area = (mesh_0.cluster_connected_triangles())
++
++    triangle_clusters = np.asarray(triangle_clusters)
++    cluster_n_triangles = np.asarray(cluster_n_triangles)
++    cluster_area = np.asarray(cluster_area)
++    n_cluster = np.sort(cluster_n_triangles.copy())[-cluster_to_keep]
++    n_cluster = max(n_cluster, 50) # filter meshes smaller than 50
++    triangles_to_remove = cluster_n_triangles[triangle_clusters] < n_cluster
++    mesh_0.remove_triangles_by_mask(triangles_to_remove)
++    mesh_0.remove_unreferenced_vertices()
++    mesh_0.remove_degenerate_triangles()
++    print("num vertices raw {}".format(len(mesh.vertices)))
++    print("num vertices post {}".format(len(mesh_0.vertices)))
++    return mesh_0
++
++
++@torch.no_grad()
++def render_set(name, iteration, suffix, args, datapack, voxel_model, volume=None):
++    views = datapack.get_train_cameras()
++    render_path = os.path.join(voxel_model.model_path, name, f"ours_{iteration}{suffix}", "renders")
++
++    tr_render_opt = {
++        'track_max_w': False,
++        'output_depth': True,
++        'output_normal': True,
++        'output_T': True,
++    }
++    depths_tsdf_fusion = []
++    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
++        render_pkg = voxel_model.render(view, **tr_render_opt)
++
++        rendering = render_pkg['color']
++        _, H, W = rendering.shape
++                
++        depth2normal = (view.depth2normal(render_pkg['depth'][0]).reshape(3,-1).permute(1,0) @ view.world_view_transform[:3,:3]).permute(1,0).reshape(3, H, W)
++        depth2normal *= -1
++        depth = render_pkg['depth'][2].squeeze()
++        depth_tsdf = depth.clone()
++        
++        
++        if args.use_depth_filter:
++            view_dir = torch.nn.functional.normalize(view.get_rays(), p=2, dim=-1)
++            depth_normal = depth2normal.permute(1,2,0)
++            depth_normal = torch.nn.functional.normalize(depth_normal, p=2, dim=-1)
++            dot = torch.sum(view_dir*depth_normal, dim=-1).abs()
++            angle = torch.acos(dot)
++            mask = angle > (80.0 / 180 * 3.14159)
++            depth_tsdf[mask] = 0
++        depths_tsdf_fusion.append(depth_tsdf.squeeze().cpu())
++        
++    if volume is not None:
++        depths_tsdf_fusion = torch.stack(depths_tsdf_fusion, dim=0)
++        for idx, view in enumerate(tqdm(views, desc="TSDF Fusion progress")):
++            ref_depth = depths_tsdf_fusion[idx].cuda()
++
++            if view.mask is not None:
++                ref_depth[view.mask.squeeze() < 0.5] = 0
++            ref_depth[ref_depth > args.max_depth] = 0
++            ref_depth[ref_depth < args.min_depth] = 0
++            ref_depth = ref_depth.detach().cpu().numpy()
++            
++            pose = np.identity(4)
++            pose[:3,:3] = view.R.transpose(-1,-2)
++            pose[:3, 3] = view.T
++            rgb_path = os.path.join(render_path, view.image_name + ".jpg")
++            if not os.path.exists(rgb_path):
++                rgb_path = os.path.join(render_path, view.image_name + ".png")
++            color = o3d.io.read_image(rgb_path)
++            depth = o3d.geometry.Image((ref_depth*1000).astype(np.uint16))
++            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
++                color, depth, depth_scale=1000.0, depth_trunc=args.max_depth, convert_rgb_to_intensity=False)
++            volume.integrate(
++                rgbd,
++                o3d.camera.PinholeCameraIntrinsic(W, H, view.Fx, view.Fy, view.Cx, view.Cy),
++                pose)
++
++        
++            
++            
++            
++    torch.cuda.synchronize()
++    
++
++
++if __name__ == "__main__":
++    # Parse arguments
++    import argparse
++    parser = argparse.ArgumentParser(
++        description="Sparse voxels raster rendering.")
++    parser.add_argument('model_path')
++    parser.add_argument("--iteration", default=-1, type=int)
++    parser.add_argument("--clear_res_down", action="store_true")
++    parser.add_argument("--suffix", default="", type=str)
++    parser.add_argument("--overwrite_ss", default=None, type=float)
++    parser.add_argument("--overwrite_vox_geo_mode", default=None)
++    
++    parser.add_argument("--max_depth", default=5.0, type=float)
++    parser.add_argument("--min_depth", default=0.0, type=float)
++    parser.add_argument("--voxel_size", default=0.002, type=float)
++    parser.add_argument("--sdf_trunc_scale", default=2.0, type=float)
++    parser.add_argument("--num_cluster", default=1, type=int)
++    parser.add_argument("--use_depth_filter", action="store_true")
++    args = parser.parse_args()
++    print("Rendering " + args.model_path)
++
++    # Load config
++    update_config(os.path.join(args.model_path, 'config.yaml'))
++
++    if args.clear_res_down:
++        cfg.data.res_downscale = 0
++        cfg.data.res_width = 0
++
++    # Load data
++    data_pack = DataPack(cfg.data, cfg.model.white_background)
++
++    cfg.model.model_path = args.model_path
++    
++    # Load model
++    voxel_model = SparseVoxelModel(cfg.model)
++    loaded_iter = voxel_model.load_iteration(args.iteration)
++
++    # Output path suffix
++    suffix = args.suffix
++    if not args.suffix:
++        if cfg.data.res_downscale > 0:
++            suffix += f"_r{cfg.data.res_downscale}"
++        if cfg.data.res_width > 0:
++            suffix += f"_w{cfg.data.res_width}"
++
++    if args.overwrite_ss:
++        voxel_model.ss = args.overwrite_ss
++        if not args.suffix:
++            suffix += f"_ss{args.overwrite_ss:.2f}"
++    
++    if args.overwrite_vox_geo_mode:
++        voxel_model.vox_geo_mode = args.overwrite_vox_geo_mode
++        if not args.suffix:
++            suffix += f"_{args.overwrite_vox_geo_mode}"
++
++    voxel_model.freeze_vox_geo()
++    
++    volume = o3d.pipelines.integration.ScalableTSDFVolume(
++    voxel_length=args.voxel_size,
++    sdf_trunc=args.sdf_trunc_scale*args.voxel_size,
++    color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
++
++    render_set(
++        "train", loaded_iter, suffix, args,
++        data_pack, voxel_model, volume)
++    print(f"extract_triangle_mesh")
++    mesh = volume.extract_triangle_mesh()
++
++    tsdf_path = os.path.join(args.model_path, "mesh", "tsdf")
++    os.makedirs(tsdf_path, exist_ok=True)
++    
++    o3d.io.write_triangle_mesh(os.path.join(tsdf_path, "tsdf_fusion.ply"), mesh, 
++                                write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
++    
++    mesh = post_process_mesh(mesh, args.num_cluster)
++    o3d.io.write_triangle_mesh(os.path.join(tsdf_path, "tsdf_fusion_post.ply"), mesh, 
++                                write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
++
+diff --git a/src/config.py b/src/config.py
+index 006e390..78ba76f 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -103,6 +103,10 @@ cfg.regularizer = CfgNode(dict(
+ 
+     # Mast3r metrid loss
+     lambda_mast3r_metric_depth = 0.0,
++    lambda_lidar_depth = 0.0,
++    lidar_depth_from = 0,
++    lidar_depth_end = 20000,
++    lidar_depth_use_conf = True,
+     mast3r_repo_path = '',
+     mast3r_metric_depth_from = 0,
+     mast3r_metric_depth_end = 20000,
+diff --git a/src/dataloader/colmap_loader.py b/src/dataloader/colmap_loader.py
+index 198eb93..d41af1e 100644
+--- a/src/dataloader/colmap_loader.py
++++ b/src/dataloader/colmap_loader.py
+@@ -305,8 +305,15 @@ def fetchPly(path):
+     plydata = PlyData.read(path)
+     vertices = plydata['vertex']
+     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
++    names = vertices.data.dtype.names
++    if 'red' in names:
++        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
++    else:
++        colors = np.full_like(positions, 0.5)   # tolerate color-less seed clouds
++    if 'nx' in names:
++        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
++    else:
++        normals = np.zeros_like(positions)      # tolerate normal-less seed clouds (LiDAR)
+     return positions, colors, normals
+ 
+ def storePly(path, xyz, rgb):
+diff --git a/src/dataloader/data_pack.py b/src/dataloader/data_pack.py
+index c583acb..1959923 100644
+--- a/src/dataloader/data_pack.py
++++ b/src/dataloader/data_pack.py
+@@ -206,7 +206,7 @@ def instantiate_a_camera(cam_info, cfg_data, dataset_downscale):
+         mask = Image.fromarray(np.array(cam_info.image.split()[-1]).astype(np.uint8))
+     else:
+         pil_image = cam_info.image
+-        mask = cam_info.mask
++        mask = None   # provided mask handled by the dedicated block below
+     
+     if (W, H) != target_resolution:
+         pil_image = pil_image.resize(target_resolution)
+@@ -237,6 +237,19 @@ def instantiate_a_camera(cam_info, cfg_data, dataset_downscale):
+             mask = mask.mean(-1)
+         mask = mask.unsqueeze(0).contiguous()
+ 
++    # Load measured LiDAR depth/confidence if the frame carries them (fork)
++    lidar_depth = lidar_conf = None
++    ldp = getattr(cam_info, 'lidar_depth_path', '')
++    if ldp and os.path.isfile(ldp):
++        _d = np.asarray(Image.open(ldp), dtype=np.float32)
++        if _d.max() > 100:  # uint16 millimetres
++            _d = _d / 1000.0
++        lidar_depth = torch.tensor(_d, dtype=torch.float32)
++        lcp = getattr(cam_info, 'lidar_conf_path', '')
++        if lcp and os.path.isfile(lcp):
++            _c = np.asarray(Image.open(lcp), dtype=np.float32)
++            lidar_conf = torch.tensor(_c / max(_c.max(), 1.0), dtype=torch.float32)
++
+     # Load depth if exist
+     depth = None
+     if cam_info.depth is not None:
+diff --git a/src/dataloader/reader_nerf_dataset.py b/src/dataloader/reader_nerf_dataset.py
+index 89dde7f..4c3bc3a 100644
+--- a/src/dataloader/reader_nerf_dataset.py
++++ b/src/dataloader/reader_nerf_dataset.py
+@@ -83,8 +83,9 @@ def read_a_camera(frame, fovx, fovy, cx_p, cy_p, path, extension, points=None, c
+         mask_path = ""
+         mask = None
+ 
+-    # Load sparse point
+-    if points is not None:
++    # Load sparse point (needs BOTH the cloud and the correspondence map;
++    # a LiDAR seed cloud without points_correspondent.json has no sparse_pt)
++    if points is not None and correspondent is not None:
+         key = f"{image_name}.{extension}"
+         sparse_pt = points[correspondent[key]]
+     else:
+@@ -100,6 +101,8 @@ def read_a_camera(frame, fovx, fovy, cx_p, cy_p, path, extension, points=None, c
+         image=image, image_path=image_path,
+         depth=depth, depth_path=depth_path,
+         mask=mask, mask_path=mask_path,
++        lidar_depth_path=os.path.join(path, frame["depth_png"]) if "depth_png" in frame else "",
++        lidar_conf_path=os.path.join(path, frame["confidence_png"]) if "confidence_png" in frame else "",
+         sparse_pt=sparse_pt,
+     )
+ 
+diff --git a/src/dataloader/reader_scene_info.py b/src/dataloader/reader_scene_info.py
+index 1e535be..1e6ee3f 100644
+--- a/src/dataloader/reader_scene_info.py
++++ b/src/dataloader/reader_scene_info.py
+@@ -37,6 +37,8 @@ class CameraInfo(NamedTuple):
+     depth_path: str = ""
+     mask: PIL.Image.Image = None
+     mask_path: str = ""
++    lidar_depth_path: str = ""
++    lidar_conf_path: str = ""
+ 
+     sparse_pt: np.array = None
+ 
+diff --git a/src/utils/bounding_utils.py b/src/utils/bounding_utils.py
+index 9e8e41c..b593186 100644
+--- a/src/utils/bounding_utils.py
++++ b/src/utils/bounding_utils.py
+@@ -79,9 +79,12 @@ def main_scene_bound_pcd_heuristic(pcd, pcd_density_rate):
+     # Find the radius with maximum point density
+     max_idx = begin_idx + density[begin_idx:].argmax()
+ 
+-    # Find the smallest radius with point density equal to pcd_density_rate of maximum
++    # Find the smallest radius with point density equal to pcd_density_rate of maximum.
++    # If the density never falls below the threshold (pre-cropped subject-only
++    # clouds, e.g. a LiDAR head scan), use the full cloud extent instead.
+     target_density = pcd_density_rate * density[max_idx]
+-    target_idx = max_idx + np.where(density[max_idx:] < target_density)[0][0]
++    below = np.where(density[max_idx:] < target_density)[0]
++    target_idx = max_idx + below[0] if len(below) else len(dist) - 1
+ 
+     radius = dist[target_idx]
+ 
+diff --git a/src/utils/lidar_depth_loss.py b/src/utils/lidar_depth_loss.py
+new file mode 100644
+index 0000000..aac4d1d
+--- /dev/null
++++ b/src/utils/lidar_depth_loss.py
+@@ -0,0 +1,87 @@
++# LiDAR measured-depth supervision (Paper B fork).
++# Core module contributed by the user; adapter wraps GeoSVR's loss convention.
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++
++class MetricLidarDepthLoss(nn.Module):
++    def __init__(self, loss_type='huber', delta=0.1):
++        super(MetricLidarDepthLoss, self).__init__()
++        self.loss_type = loss_type
++        self.delta = delta  # For Huber loss
++
++    def forward(self, rendered_depth, lidar_depth, confidence_map=None):
++        """Direct metric loss between rendered depth and iPhone LiDAR depth."""
++        if rendered_depth.shape != lidar_depth.shape:
++            rendered_depth = F.interpolate(
++                rendered_depth.unsqueeze(0).unsqueeze(0),
++                size=lidar_depth.shape[-2:],
++                mode='bilinear',
++                align_corners=False
++            ).squeeze(0).squeeze(0)
++
++        # 1. Sparsity masking: invalid/dropped LiDAR pixels are 0.0 or NaN
++        valid_mask = (lidar_depth > 0.0) & (~torch.isnan(lidar_depth))
++        if not valid_mask.any():
++            return torch.tensor(0.0, device=rendered_depth.device, requires_grad=True)
++
++        pred_valid = rendered_depth[valid_mask]
++        target_valid = lidar_depth[valid_mask]
++
++        # 2. Core metric loss (NO scale-and-shift optimization)
++        if self.loss_type == 'l1':
++            loss_per_pixel = torch.abs(pred_valid - target_valid)
++        elif self.loss_type == 'huber':
++            loss_per_pixel = F.huber_loss(pred_valid, target_valid, reduction='none', delta=self.delta)
++        else:
++            loss_per_pixel = (pred_valid - target_valid) ** 2
++
++        # 3. Confidence weighting (normalized to avoid loss-scale explosion)
++        if confidence_map is not None:
++            weights_valid = confidence_map[valid_mask]
++            loss = torch.sum(loss_per_pixel * weights_valid) / (torch.sum(weights_valid) + 1e-7)
++        else:
++            loss = torch.mean(loss_per_pixel)
++
++        return loss
++
++
++class LidarDepthLossAdapter:
++    """GeoSVR loss convention: __call__(cam, render_pkg, iteration).
++
++    Renders' expected depth is alpha-normalized on active pixels (same
++    treatment as Mast3rMetricDepthLoss); the measured map and optional
++    confidence come from cam.lidar_depth / cam.lidar_conf, loaded by the
++    data pack when frames carry depth_png / confidence_png.
++    """
++
++    def __init__(self, iter_from, iter_end, use_confidence=True,
++                 loss_type='huber', delta=0.1):
++        self.iter_from = iter_from
++        self.iter_end = iter_end
++        self.use_confidence = use_confidence
++        self.core = MetricLidarDepthLoss(loss_type=loss_type, delta=delta)
++
++    def is_active(self, iteration):
++        return self.iter_from <= iteration <= self.iter_end
++
++    def __call__(self, cam, render_pkg, iteration):
++        if not self.is_active(iteration):
++            return 0
++        if getattr(cam, "lidar_depth", None) is None:
++            return 0
++        alpha = (1 - render_pkg['raw_T'][None])          # [1,H,W]
++        depth = render_pkg['raw_depth'][[0]][None]       # expected depth
++        ref = cam.lidar_depth.cuda()                     # [h,w] metres
++        conf = cam.lidar_conf.cuda() if (self.use_confidence and
++                getattr(cam, "lidar_conf", None) is not None) else None
++        # alpha-normalize where the model is opaque enough to define depth
++        d = torch.nn.functional.interpolate(depth, size=ref.shape[-2:],
++                                            mode='bilinear', antialias=True)[0, 0]
++        a = torch.nn.functional.interpolate(alpha, size=ref.shape[-2:],
++                                            mode='bilinear', antialias=True)[0, 0]
++        act = a > 0.5
++        d = torch.where(act, d / a.clamp_min(1e-6), torch.zeros_like(d))
++        ref = torch.where(act, ref, torch.zeros_like(ref))   # -> masked invalid by core
++        return self.core(d, ref, conf)
+diff --git a/src/utils/octree_utils.py b/src/utils/octree_utils.py
+index f311360..691dec2 100644
+--- a/src/utils/octree_utils.py
++++ b/src/utils/octree_utils.py
+@@ -57,6 +57,8 @@ def level_2_vox_size(scene_extent, octlevel):
+         @octlevel:      [N, 1]
+     '''
+     # Formula of voxel size: scene_extent * pow(2, -L)
++    if torch.is_tensor(octlevel) and torch.is_tensor(scene_extent) and octlevel.device != scene_extent.device:
++        octlevel = octlevel.to(scene_extent.device)   # torch>=2 same-device requirement
+     return torch.ldexp(scene_extent, -octlevel)
+ 
+ def vox_size_2_level(scene_extent, vox_size):
+diff --git a/train.py b/train.py
+index c2d5e33..9d66692 100644
+--- a/train.py
++++ b/train.py
+@@ -72,6 +72,10 @@ def training(args):
+             source_path=cfg.data.source_path,
+             force_rerun=False)
+ 
++    from src.utils.lidar_depth_loss import LidarDepthLossAdapter
++    lidar_depth_loss = LidarDepthLossAdapter(
++        cfg.regularizer.lidar_depth_from, cfg.regularizer.lidar_depth_end,
++        use_confidence=cfg.regularizer.lidar_depth_use_conf)
+     if cfg.regularizer.lambda_mast3r_metric_depth:
+         mono_utils.prepare_mast3r_metric_depth(
+             cameras=tr_cams,
+@@ -121,7 +125,7 @@ def training(args):
+             cfg.procedure.subdivide_every
+         )
+     )
+-    subdivide_scale = cfg.procedure.subdivide_target_scale ** (1 / remain_subdiv_times)
++    subdivide_scale = cfg.procedure.subdivide_target_scale ** (1 / max(remain_subdiv_times, 1))
+     subdivide_prop = max(0, (subdivide_scale - 1) / 7)
+     print(f"Subdiv: times={remain_subdiv_times:2d} scale-each-time={subdivide_scale*100:.1f}% prop={subdivide_prop*100:.1f}%")
+ 
+@@ -209,11 +213,12 @@ def training(args):
+         need_sparse_depth = cfg.regularizer.lambda_sparse_depth > 0 and sparse_depth_loss.is_active(iteration)
+         need_depthanythingv2 = cfg.regularizer.lambda_depthanythingv2 > 0 and depthanythingv2_loss.is_active(iteration)
+         need_mast3r_metric_depth = cfg.regularizer.lambda_mast3r_metric_depth > 0 and mast3r_metric_depth_loss.is_active(iteration)
++        need_lidar_depth = cfg.regularizer.lambda_lidar_depth > 0 and lidar_depth_loss.is_active(iteration)
+         need_nd_loss = cfg.regularizer.lambda_normal_dmean > 0 and nd_loss.is_active(iteration)
+         need_nmed_loss = cfg.regularizer.lambda_normal_dmed > 0 and nmed_loss.is_active(iteration)
+         need_nmono_loss = cfg.regularizer.lambda_normal_dmono > 0 and nmono_loss.is_active(iteration)
+         need_level_uncertainty = cfg.regularizer.power_level_uncertainty > 0 and iteration > cfg.regularizer.level_uncertainty_from
+-        tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_level_uncertainty
++        tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_lidar_depth or need_level_uncertainty
+         tr_render_opt['output_normal'] = need_nd_loss or need_nmed_loss or iteration > cfg.regularizer.multi_view_weight_from_iter
+         tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or iteration > cfg.regularizer.multi_view_weight_from_iter
+         # tr_render_opt['output_depth'] = True
+@@ -277,6 +282,8 @@ def training(args):
+ 
+         if need_mast3r_metric_depth:
+             loss += cfg.regularizer.lambda_mast3r_metric_depth * mast3r_metric_depth_loss(cam, render_pkg, iteration)
++        if need_lidar_depth:
++            loss += cfg.regularizer.lambda_lidar_depth * lidar_depth_loss(cam, render_pkg, iteration)
+ 
+         if cfg.regularizer.lambda_ssim:
+             loss += cfg.regularizer.lambda_ssim * loss_utils.fast_ssim_loss(render_image, gt_image)
+-- 
+2.53.0
+
+
+From 24ffd11847fa03ad36b75449b529c0d3b9ddf560 Mon Sep 17 00:00:00 2001
+From: ken001111 <ken001111@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 12:39:49 -0500
+Subject: [PATCH 2/3] guard mono-prior visualization when priors absent
+ (lidar-only runs)
+
+---
+ train.py | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/train.py b/train.py
+index 9d66692..069d4ef 100644
+--- a/train.py
++++ b/train.py
+@@ -733,11 +733,14 @@ def training_report(data_pack, voxel_model, iteration, loss, psnr, elapsed, ema_
+         
+         render_normal_from_points = render_normal_func(view, render_depth.squeeze())
+         render_normal_med_from_points = render_normal_func(view, render_depth_med.squeeze())
+-        mono = 1 / view.depthanythingv2.clamp(min=1e-4).cuda()
+-        if render_depth.shape[-2:] != mono.shape[-2:]:
+-            mono = torch.nn.functional.interpolate(
+-                mono[None, None], size=render_depth.shape[-2:], mode='bilinear').squeeze()
+-        render_normal_mono_from_points = render_normal_func(view, mono)
++        if hasattr(view, 'depthanythingv2'):
++            mono = 1 / view.depthanythingv2.clamp(min=1e-4).cuda()
++            if render_depth.shape[-2:] != mono.shape[-2:]:
++                mono = torch.nn.functional.interpolate(
++                    mono[None, None], size=render_depth.shape[-2:], mode='bilinear').squeeze()
++            render_normal_mono_from_points = render_normal_func(view, mono)
++        else:
++            render_normal_mono_from_points = torch.zeros_like(render_normal_from_points)
+         
+         render_vox_level = render_pkg['feat']/(1-render_pkg['T'][0]).clamp(min=0.1).squeeze().detach()
+         level_weight = (render_vox_level.max()-render_vox_level.min())/(render_vox_level-render_vox_level.min()).clamp(min=1.0)
+-- 
+2.53.0
+
+
+From 8f5a7099a841b70de980d4aa824bfa6ef577fa53 Mon Sep 17 00:00:00 2001
+From: ken001111 <ken001111@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 12:48:44 -0500
+Subject: [PATCH 3/3] fix: actually attach lidar_depth/conf to Camera; request
+ depth output; show lidar term in progress bar
+
+---
+ src/dataloader/data_pack.py | 19 +++++++++++--------
+ train.py                    | 11 +++++++++--
+ 2 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/src/dataloader/data_pack.py b/src/dataloader/data_pack.py
+index 1959923..0cec557 100644
+--- a/src/dataloader/data_pack.py
++++ b/src/dataloader/data_pack.py
+@@ -260,14 +260,17 @@ def instantiate_a_camera(cam_info, cfg_data, dataset_downscale):
+         depth = torch.tensor(np.array(pil_depth) / cfg_data.depth_scale, dtype=torch.float32)
+         depth = depth.unsqueeze(0).contiguous()
+ 
+-    return Camera(w2c=cam_info.w2c,
+-                  fovx=cam_info.fovx, fovy=cam_info.fovy,
+-                  cx_p=cam_info.cx_p, cy_p=cam_info.cy_p,
+-                  R=cam_info.R, T=cam_info.T,
+-                  image=gt_image, mask=mask, depth=depth,
+-                  sparse_pt=cam_info.sparse_pt,
+-                  ncc_scale=ncc_scale,
+-                  image_name=cam_info.image_name)
++    camera = Camera(w2c=cam_info.w2c,
++                    fovx=cam_info.fovx, fovy=cam_info.fovy,
++                    cx_p=cam_info.cx_p, cy_p=cam_info.cy_p,
++                    R=cam_info.R, T=cam_info.T,
++                    image=gt_image, mask=mask, depth=depth,
++                    sparse_pt=cam_info.sparse_pt,
++                    ncc_scale=ncc_scale,
++                    image_name=cam_info.image_name)
++    camera.lidar_depth = lidar_depth
++    camera.lidar_conf = lidar_conf
++    return camera
+ 
+ 
+ def instantiate_a_minicamera(cam_info, cfg_data, dataset_downscale=1):
+diff --git a/train.py b/train.py
+index 069d4ef..b1234e0 100644
+--- a/train.py
++++ b/train.py
+@@ -185,6 +185,7 @@ def training(args):
+     ema_pixel_for_log = 0.0
+     ema_photo_for_log = 0.0
+     ema_depth_for_log = 0.0
++    ema_lidar_for_log = 0.0
+     iter_rng = range(first_iter, cfg.procedure.n_iter+1)
+     progress_bar = tqdm(iter_rng, desc="Training", ascii=True)
+     for iteration in iter_rng:
+@@ -220,7 +221,7 @@ def training(args):
+         need_level_uncertainty = cfg.regularizer.power_level_uncertainty > 0 and iteration > cfg.regularizer.level_uncertainty_from
+         tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_lidar_depth or need_level_uncertainty
+         tr_render_opt['output_normal'] = need_nd_loss or need_nmed_loss or iteration > cfg.regularizer.multi_view_weight_from_iter
+-        tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or iteration > cfg.regularizer.multi_view_weight_from_iter
++        tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_lidar_depth or iteration > cfg.regularizer.multi_view_weight_from_iter
+         # tr_render_opt['output_depth'] = True
+ 
+         if iteration >= cfg.regularizer.dist_from and cfg.regularizer.lambda_dist:
+@@ -283,7 +284,10 @@ def training(args):
+         if need_mast3r_metric_depth:
+             loss += cfg.regularizer.lambda_mast3r_metric_depth * mast3r_metric_depth_loss(cam, render_pkg, iteration)
+         if need_lidar_depth:
+-            loss += cfg.regularizer.lambda_lidar_depth * lidar_depth_loss(cam, render_pkg, iteration)
++            lidar_loss_val = lidar_depth_loss(cam, render_pkg, iteration)
++            loss += cfg.regularizer.lambda_lidar_depth * lidar_loss_val
++        else:
++            lidar_loss_val = None
+ 
+         if cfg.regularizer.lambda_ssim:
+             loss += cfg.regularizer.lambda_ssim * loss_utils.fast_ssim_loss(render_image, gt_image)
+@@ -674,6 +678,8 @@ def training(args):
+             ema_pixel_for_log = 0.6 * ema_pixel_for_log + 0.4 * geo_loss.item()
+             ema_photo_for_log = 0.6 * ema_photo_for_log + 0.4 * photo_loss.item()
+             ema_depth_for_log = 0.6 * ema_depth_for_log + 0.4 * depth_loss.item()
++            if lidar_loss_val is not None:
++                ema_lidar_for_log = 0.6 * ema_lidar_for_log + 0.4 * float(lidar_loss_val)
+             if iteration % 10 == 0:
+                 pb_text = {
+                     "Loss": f"{ema_loss_for_log:.5f}",
+@@ -681,6 +687,7 @@ def training(args):
+                     "pixel": f"{ema_pixel_for_log:.4f}",
+                     "ncc": f"{ema_ncc_for_log:.4f}",
+                     # "depth": f"{ema_depth_for_log:.5f}",
++                    "lidar": f"{ema_lidar_for_log:.4f}",
+                     "psnr": f"{ema_psnr_for_log:.2f}",
+                 }
+                 progress_bar.set_postfix(pb_text)
+-- 
+2.53.0
+
