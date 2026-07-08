@@ -15,7 +15,7 @@ import numpy as np
 import open3d as o3d
 
 sys.path.insert(0, os.path.expanduser("~/pe_verify/common"))
-from eval_common import evaluate_full
+from eval_common import full_stats, fscore
 
 LASER_DIR = os.path.expanduser("~/FaceScan/data/arkit/laser_scanner_point_clouds/470831")
 SCENE_DIR = os.path.expanduser("~/FaceScan/data/arkit/raw/Validation/47331963")
@@ -50,38 +50,80 @@ def build_gt():
     return merged
 
 
+def _floor_z(z, res=0.02):
+    """Dominant low height = floor (histogram peak in the bottom 30%)."""
+    lo, hi = np.percentile(z, [0.5, 99.5])
+    edges = np.arange(lo, lo + (hi - lo) * 0.3 + res, res)
+    h, e = np.histogram(z, bins=edges)
+    return float(e[np.argmax(h)])
+
+
+def _occupancy(xy, res=0.05, bbox=None):
+    if bbox is None:
+        bbox = (xy.min(0) - 0.5, xy.max(0) + 0.5)
+    ij = np.floor((xy - bbox[0]) / res).astype(int)
+    shape = np.floor((bbox[1] - bbox[0]) / res).astype(int) + 1
+    ok = (ij >= 0).all(1) & (ij < shape).all(1)
+    m = np.zeros(shape, np.float32)
+    m[ij[ok, 0], ij[ok, 1]] = 1.0
+    return m, bbox
+
+
 def register_arkit_to_site(gt):
-    """One transform for the whole scene, from the ARKit 3dod mesh."""
+    """Gravity-aware 4DOF registration: ARKit(y-up) -> Faro site frame (z-up).
+
+    Floor-height match fixes tz; exhaustive yaw x FFT cross-correlation of
+    wall-band occupancy maps fixes (yaw, tx, ty); point-to-plane ICP refines.
+    Deterministic - no RANSAC.
+    """
+    from scipy.signal import fftconvolve
     t_path = f"{CACHE}/T_arkit_to_site.txt"
     if os.path.isfile(t_path):
         return np.loadtxt(t_path)
     mesh = o3d.io.read_triangle_mesh(f"{SCENE_DIR}/47331963_3dod_mesh.ply")
-    src = mesh.sample_points_uniformly(400_000)
+    src_pc = mesh.sample_points_uniformly(400_000)
+    P = np.asarray(src_pc.points)
+    R_up = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)  # y-up -> z-up
+    P = P @ R_up.T
+    G = np.asarray(gt.voxel_down_sample(0.05).points)
 
-    def prep(pc, vox):
-        p = pc.voxel_down_sample(vox)
-        p.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(vox * 2.5, 30))
-        f = o3d.pipelines.registration.compute_fpfh_feature(
-            p, o3d.geometry.KDTreeSearchParamHybrid(vox * 5, 100))
-        return p, f
+    fz_src, fz_gt = _floor_z(P[:, 2]), _floor_z(G[:, 2])
+    dz = fz_gt - fz_src
+    P[:, 2] += dz
+    band = lambda Q, fz: Q[(Q[:, 2] > fz + 0.3) & (Q[:, 2] < fz + 2.2)]
+    Pb, Gb = band(P, fz_gt), band(G, fz_gt)
+    res = 0.05
+    gt_map, gt_bbox = _occupancy(Gb[:, :2], res)
 
-    vox = 0.05
-    s, sf = prep(src, vox)
-    g, gf = prep(gt, vox)
-    res = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-        s, g, sf, gf, mutual_filter=True, max_correspondence_distance=vox * 1.5,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-        ransac_n=3,
-        checkers=[o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-                  o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(vox * 1.5)],
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(400_000, 0.9999))
-    print(f"  RANSAC fitness={res.fitness:.3f} rmse={res.inlier_rmse*1000:.1f}mm")
-    T = res.transformation
-    for dist in (0.05, 0.02, 0.008):
-        g.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(dist * 3, 30))
+    best = (-1.0, 0.0, 0, 0)   # score, yaw, di, dj
+    ctr = Pb[:, :2].mean(0)
+    for yaw_deg in range(0, 360, 2):
+        a = np.radians(yaw_deg)
+        R2 = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        xy = (Pb[:, :2] - ctr) @ R2.T
+        src_map, _ = _occupancy(xy, res, (xy.min(0) - 0.25, xy.max(0) + 0.25))
+        corr = fftconvolve(gt_map, src_map[::-1, ::-1], mode="full")
+        k = np.unravel_index(np.argmax(corr), corr.shape)
+        off = np.array(k) - (np.array(src_map.shape) - 1)
+        if corr[k] > best[0]:
+            best = (float(corr[k]), a, off[0], off[1])
+    score, a, di, dj = best
+    R2 = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    # src cell (0,0) after rotation maps to gt cell (di,dj)
+    xy0 = ((Pb[:, :2] - ctr) @ R2.T).min(0) - 0.25
+    t2 = gt_bbox[0] + np.array([di, dj]) * res - xy0
+    print(f"  yaw-search: yaw={np.degrees(a):.0f}deg score={score:.0f}")
+
+    T = np.eye(4)
+    T[:2, :2] = R2
+    T[:3, 3] = [*(t2 - R2 @ ctr), dz]
+    T = T @ np.block([[R_up, np.zeros((3, 1))], [np.zeros((1, 3)), 1]])
+
+    src_chk = o3d.geometry.PointCloud(src_pc)
+    for dist in (0.10, 0.03, 0.012):
         icp = o3d.pipelines.registration.registration_icp(
-            s, g, dist, T,
-            o3d.pipelines.registration.TransformationEstimationPointToPlane())
+            src_chk, gt, dist, T,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint())
         T = icp.transformation
         print(f"  ICP@{dist*1000:.0f}mm fitness={icp.fitness:.3f} rmse={icp.inlier_rmse*1000:.1f}mm")
     np.savetxt(t_path, T)
@@ -109,6 +151,12 @@ def main():
     print(f"  gt: {len(gt.points)} pts")
     print("[2/3] ARKit->site registration")
     T = register_arkit_to_site(gt)
+    mesh_3dod = o3d.io.read_triangle_mesh(f"{SCENE_DIR}/47331963_3dod_mesh.ply")
+    src_check = mesh_3dod.sample_points_uniformly(100_000)
+    src_check.transform(T)
+    for d in (0.05, 0.02):
+        ev = o3d.pipelines.registration.evaluate_registration(src_check, gt, d)
+        print(f"  registration check @{d*1000:.0f}mm: fitness={ev.fitness:.3f} rmse={ev.inlier_rmse*1000:.1f}mm")
     gt_room = crop_gt_to_scene(gt, T)
     print(f"  gt cropped to room: {len(gt_room.points)} pts")
     gt_mm = np.asarray(gt_room.points) * 1000.0
@@ -119,23 +167,31 @@ def main():
         out_json = f"{mdir}/eval_vs_faro.json"
         if os.path.isfile(out_json):
             print(f"  [{arm}] cached"); continue
-        # find the extracted mesh (tsdf_mesh.py writes under mesh/)
-        cands = []
-        for root, _, files in os.walk(mdir):
-            cands += [os.path.join(root, f) for f in files if f.endswith(".ply")]
-        if not cands:
+        # cluster-filtered TSDF mesh written by mesh_extract/tsdf_mesh.py
+        mesh_path = f"{mdir}/mesh/tsdf/tsdf_fusion_post.ply"
+        if not os.path.isfile(mesh_path):
             print(f"  [{arm}] NO MESH - skip"); continue
-        mesh_path = max(cands, key=os.path.getmtime)
         mesh = o3d.io.read_triangle_mesh(mesh_path)
         mesh.transform(T)
-        pts_mm = np.asarray(mesh.sample_points_uniformly(1_000_000).points) * 1000.0
-        r = evaluate_full(pts_mm, gt_mm, align=True, icp_threshold_mm=20.0,
-                          taus=TAUS_MM)
+        rec = mesh.sample_points_uniformly(1_000_000)
+        # per-arm rigid refine onto the laser GT (20mm), then point-to-point NN
+        icp = o3d.pipelines.registration.registration_icp(
+            rec, gt_room, 0.02, np.eye(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPoint())
+        rec.transform(icp.transformation)
+        rec_mm = np.asarray(rec.points) * 1000.0
+        from scipy.spatial import cKDTree
+        d_acc = cKDTree(gt_mm).query(rec_mm, workers=-1)[0]     # recon -> GT
+        d_comp = cKDTree(rec_mm).query(gt_mm, workers=-1)[0]    # GT -> recon
+        r = {("acc_" + k): v for k, v in full_stats(d_acc).items()}
+        r.update({("comp_" + k): v for k, v in full_stats(d_comp).items()})
+        r["chamfer"] = 0.5 * (r["acc_mean"] + r["comp_mean"])
+        r.update(fscore(d_acc, d_comp, TAUS_MM))
+        r["icp_fitness"] = float(icp.fitness)
         r["mesh"] = mesh_path
-        r.pop("T", None)
         json.dump(r, open(out_json, "w"), indent=1, default=float)
         print(f"  [{arm}] acc_mean={r['acc_mean']:.2f}mm comp_mean={r['comp_mean']:.2f}mm "
-              f"chamfer={r['chamfer']:.2f}mm F@20mm={r['fscore@20.0']:.3f}")
+              f"chamfer={r['chamfer']:.2f}mm F@20mm={r['fscore@20.0']:.3f} icp_fit={icp.fitness:.3f}")
 
 
 if __name__ == "__main__":
