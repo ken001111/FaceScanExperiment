@@ -78,10 +78,14 @@ def main():
             if os.path.isfile(src) and not os.path.exists(dst):
                 os.link(src, dst)
         c2w_gl = c2w_cv @ flip
+        import math
         frames.append(dict(file_path=f"images/{name}",
                            depth_png=f"depth/{name}.png",
                            confidence_png=f"confidence/{name}.png",
                            w=w, h=h, fl_x=fx, fl_y=fy, cx=cx, cy=cy,
+                           camera_angle_x=2 * math.atan(w / (2 * fx)),
+                           camera_angle_y=2 * math.atan(h / (2 * fy)),
+                           cx_p=cx / w, cy_p=cy / h,
                            transform_matrix=c2w_gl.tolist()))
         # back-project depth (subsampled) into the measured seed cloud
         if os.path.isfile(dp) and i % 4 == 0:
