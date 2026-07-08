@@ -19,6 +19,7 @@ write_overrides () {  # $1=arm
       cat > "$f" <<'YAML'
 regularizer:
   lambda_depthanythingv2: 0.0
+  lambda_normal_dmono: 0.0
   lambda_lidar_depth: 0.0
 YAML
       ;;
@@ -32,6 +33,7 @@ YAML
       cat > "$f" <<'YAML'
 regularizer:
   lambda_depthanythingv2: 0.0
+  lambda_normal_dmono: 0.0
   lambda_lidar_depth: 0.1
   lidar_depth_from: 0
   lidar_depth_end: 20000
@@ -42,6 +44,18 @@ YAML
       cat > "$f" <<'YAML'
 regularizer:
   lambda_depthanythingv2: 0.0
+  lambda_normal_dmono: 0.0
+  lambda_lidar_depth: 0.1
+  lidar_depth_from: 0
+  lidar_depth_end: 20000
+  lidar_depth_use_conf: True
+YAML
+      ;;
+    fused)
+      cat > "$f" <<'YAML'
+regularizer:
+  lambda_depthanythingv2: 0.0
+  lambda_normal_dmono: 0.0
   lambda_lidar_depth: 0.1
   lidar_depth_from: 0
   lidar_depth_end: 20000
@@ -54,6 +68,8 @@ YAML
 
 run_arm () {  # $1=arm
   local arm=$1 mp="$OUTROOT/$1" log=~/FaceScan/paperB/logs/ablate_$1.log
+  local src="$SRC"
+  [ "$arm" = fused ] && src="${SRC}_fused"
   if [ -f "$mp/checkpoints/iter020000_model.pt" ]; then
     echo "[$arm] final checkpoint exists - skip"; return 0
   fi
@@ -67,7 +83,7 @@ run_arm () {  # $1=arm
   fi
   echo "[$arm] training -> $mp"
   python train.py --cfg_files cfg/dtu_mesh.yaml "$ov" \
-    --source_path "$SRC" --model_path "$mp" \
+    --source_path "$src" --model_path "$mp" \
     --bound_mode camera_median --bound_scale 1.0 --subdivide_max_num 2000000 \
     --n_iter 20000 --checkpoint_iterations 5000 10000 15000 \
     --test_iterations -1 "${resume[@]}" >> "$log" 2>&1
@@ -79,7 +95,7 @@ run_arm () {  # $1=arm
 }
 
 overall=0
-for arm in nodepth lidar lidarconf mono; do
+for arm in nodepth lidar lidarconf mono fused; do
   run_arm "$arm" || overall=1
 done
 echo "ALL_DONE overall=$overall"
