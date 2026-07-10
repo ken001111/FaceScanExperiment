@@ -35,6 +35,24 @@ echo "=== TABLES ==="
 cat ~/FaceScan/paperA/table3_dev.json 2>/dev/null
 cat ~/FaceScan/initstudy/summary.txt 2>/dev/null | tail -6
 echo ""
+echo "=== PAPER B: ARKITSCENES ABLATION (scene1=47331963, scene2=41069021 laser-GT) ==="
+for sc in ablation ablation_41069021; do
+  for arm in nodepth mono lidar lidarconf fused; do
+    f=~/FaceScan/paperB/$sc/$arm/mesh/tsdf/tsdf_fusion_post.ply
+    [ -f "$f" ] && du -h "$f" | sed 's|/home/m352395/|~|'
+    c=~/FaceScan/paperB/$sc/$arm/checkpoints/iter020000_model.pt
+    [ -f "$c" ] && du -h "$c" | sed 's|/home/m352395/|~|'
+  done
+done
+echo "--- laser-GT evals (scene 41069021, protocol v6 + region split) ---"
+for f in ~/FaceScan/paperB/ablation_41069021/*/eval_vs_laser_v6.json ~/FaceScan/paperB/ablation_41069021/*/region_split.json; do
+  [ -f "$f" ] && echo "$(echo $f | sed 's|/home/m352395/|~|'): $(head -c 110 $f | tr -d '\n ')"
+done
+echo "--- GT + results ---"
+du -sh ~/FaceScan/paperB/gt_cache/*.ply 2>/dev/null | sed 's|/home/m352395/|~|'
+ls ~/facescan-experiments/paperB/RESULTS_41069021.md >/dev/null 2>&1 && echo "results note: ~/facescan-experiments/paperB/RESULTS_41069021.md"
+echo "figures: Downloads/ablation_figs (fig1_coverage fig2_comp_heatmap fig3_metrics fig4_elevation)"
+echo ""
 echo "=== DATASETS PREPARED ==="
 du -sh ~/FaceScan/work/* ~/FaceScan/data/* 2>/dev/null | sed 's|/home/m352395/|~|'
 echo INVENTORY_DONE

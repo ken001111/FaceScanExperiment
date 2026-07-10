@@ -72,9 +72,21 @@ def main():
         lidar = iio.imread(f"{src}/depth/{name}.png").astype(np.float32) / 1000.0
         conf_p = f"{src}/confidence/{name}.png"
         conf = iio.imread(conf_p).astype(np.float32) if os.path.isfile(conf_p) else None
-        idx = iio.imread(f"{prior_root}/{name}.png")
-        codebook = np.load(f"{prior_root}/{name}.npy")
-        dav2 = codebook[idx].astype(np.float64)
+        try:
+            idx = iio.imread(f"{prior_root}/{name}.png")
+            codebook = np.load(f"{prior_root}/{name}.npy")
+            dav2 = codebook[idx].astype(np.float64)
+        except Exception:
+            # missing/corrupt prior -> raw LiDAR fallback (still metric)
+            iio.imwrite(f"{out}/depth_fused/{name}.png",
+                        np.round(lidar * 1000.0).astype(np.uint16))
+            stats[name] = dict(fallback=True, bad_prior=True)
+            n_fallback += 1
+            for sub in ("images", "confidence"):
+                sp, dp = f"{src}/{sub}/{name}.png", f"{out}/{sub}/{name}.png"
+                if os.path.isfile(sp) and not os.path.exists(dp):
+                    os.link(sp, dp)
+            continue
         if dav2.shape != lidar.shape:  # DAv2 runs at its own res; bring to LiDAR grid
             from PIL import Image
             dav2 = np.asarray(Image.fromarray(dav2.astype(np.float32)).resize(

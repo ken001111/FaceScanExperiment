@@ -62,6 +62,21 @@ regularizer:
   lidar_depth_use_conf: True
 YAML
       ;;
+    seeded)   # full method: fused depth loss + LiDAR-seeded voxel init
+      cat > "$f" <<YAML
+regularizer:
+  lambda_depthanythingv2: 0.0
+  lambda_normal_dmono: 0.0
+  lambda_lidar_depth: 0.1
+  lidar_depth_from: 0
+  lidar_depth_end: 20000
+  lidar_depth_use_conf: True
+init:
+  init_mode: seeded
+  seed_path: ${SRC}_fused/seeds.npy
+  seed_dilate: 1
+YAML
+      ;;
   esac
   echo "$f"
 }
@@ -69,12 +84,16 @@ YAML
 run_arm () {  # $1=arm
   local arm=$1 mp="$OUTROOT/$1" log=~/FaceScan/paperB/logs/ablate_$(basename $OUTROOT)_$1.log
   local src="$SRC"
-  if [ "$arm" = fused ]; then
+  if [ "$arm" = fused ] || [ "$arm" = seeded ]; then
     src="${SRC}_fused"
     if [ ! -f "$src/transforms_train.json" ]; then
-      echo "[fused] building fused depth (needs mono priors from mono arm)"
-      python ~/facescan-experiments/paperB/fuse_depth.py "$SRC" || { echo "[fused] fuse_depth FAILED"; return 1; }
+      echo "[$arm] building fused depth (needs mono priors from mono arm)"
+      python ~/facescan-experiments/paperB/fuse_depth.py "$SRC" || { echo "[$arm] fuse_depth FAILED"; return 1; }
     fi
+  fi
+  if [ "$arm" = seeded ] && [ ! -f "$src/seeds.npy" ]; then
+    echo "[seeded] generating seed cloud from fused depth"
+    python ~/facescan-experiments/paperB/make_seeds.py "$src" || { echo "[seeded] make_seeds FAILED"; return 1; }
   fi
   if [ -f "$mp/checkpoints/iter020000_model.pt" ]; then
     echo "[$arm] final checkpoint exists - skip"; return 0
@@ -108,7 +127,7 @@ run_arm () {  # $1=arm
 }
 
 overall=0
-for arm in nodepth lidar lidarconf mono fused; do
+for arm in ${ABLATE_ARMS:-nodepth lidar lidarconf mono fused seeded}; do
   run_arm "$arm" || overall=1
 done
 echo "ALL_DONE overall=$overall"
