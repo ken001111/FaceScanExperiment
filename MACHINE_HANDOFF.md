@@ -50,6 +50,11 @@ this repo's setup scripts (they encode every sm_120/Blackwell fix).
 
 ## New-machine setup order (Windows Dell laptop + WSL2 assumed)
 
+0. DUAL-GPU NOTE: the Dell has an internal RTX 5070 Laptop (8 GB) alongside the
+   5080 eGPU. Both appear in WSL as cuda:0/cuda:1 under the one GeForce driver;
+   select per-job with CUDA_VISIBLE_DEVICES. Plan: 5080 = heavy training,
+   5070 = DAV2 priors / rendering / mesh extraction / face-scale arms + display.
+   Methods are single-GPU - parallelism = two independent jobs, RAM permitting.
 0. Dell prep: run Dell Command Update (BIOS + Thunderbolt firmware), confirm
    the USB-C port is TB4/USB4 (lightning-bolt icon / spec sheet). Plain
    USB-C 3.x will NOT run an eGPU.
