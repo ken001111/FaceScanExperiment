@@ -54,7 +54,10 @@ this repo's setup scripts (they encode every sm_120/Blackwell fix).
    5080 eGPU. Both appear in WSL as cuda:0/cuda:1 under the one GeForce driver;
    select per-job with CUDA_VISIBLE_DEVICES. Plan: 5080 = heavy training,
    5070 = DAV2 priors / rendering / mesh extraction / face-scale arms + display.
-   Methods are single-GPU - parallelism = two independent jobs, RAM permitting.
+   Methods are single-GPU. Dell RAM = 32GB -> ONE training at a time (5080) +
+   light 5070 sidecar only (priors/render/small arms; NOT a second training,
+   NOT TSDF fusion during training). .wslconfig start point: memory=20GB
+   swap=8GB, tune down if Windows-side commit gets tight (see step 5).
 0. Dell prep: run Dell Command Update (BIOS + Thunderbolt firmware), confirm
    the USB-C port is TB4/USB4 (lightning-bolt icon / spec sheet). Plain
    USB-C 3.x will NOT run an eGPU.
