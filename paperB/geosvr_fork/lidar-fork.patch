@@ -1,24 +1,3 @@
-From 28af0cde7b0ffb47e83374c62cfec3addaf3b715 Mon Sep 17 00:00:00 2001
-From: ken001111 <ken001111@users.noreply.github.com>
-Date: Wed, 8 Jul 2026 12:24:28 -0500
-Subject: [PATCH 1/3] LiDAR measured-depth supervision: MetricLidarDepthLoss
- (user) + adapter, config, loader plumbing
-
----
- mesh_extract/tsdf_mesh_band.py        | 216 ++++++++++++++++++++++++++
- src/config.py                         |   4 +
- src/dataloader/colmap_loader.py       |  11 +-
- src/dataloader/data_pack.py           |  15 +-
- src/dataloader/reader_nerf_dataset.py |   7 +-
- src/dataloader/reader_scene_info.py   |   2 +
- src/utils/bounding_utils.py           |   7 +-
- src/utils/lidar_depth_loss.py         |  87 +++++++++++
- src/utils/octree_utils.py             |   2 +
- train.py                              |  11 +-
- 10 files changed, 353 insertions(+), 9 deletions(-)
- create mode 100644 mesh_extract/tsdf_mesh_band.py
- create mode 100644 src/utils/lidar_depth_loss.py
-
 diff --git a/mesh_extract/tsdf_mesh_band.py b/mesh_extract/tsdf_mesh_band.py
 new file mode 100644
 index 0000000..866425d
@@ -242,7 +221,7 @@ index 0000000..866425d
 +                                write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
 +
 diff --git a/src/config.py b/src/config.py
-index 006e390..78ba76f 100644
+index 006e390..9eb51df 100644
 --- a/src/config.py
 +++ b/src/config.py
 @@ -103,6 +103,10 @@ cfg.regularizer = CfgNode(dict(
@@ -256,6 +235,21 @@ index 006e390..78ba76f 100644
      mast3r_repo_path = '',
      mast3r_metric_depth_from = 0,
      mast3r_metric_depth_end = 20000,
+@@ -185,6 +189,14 @@ cfg.init = CfgNode(dict(
+     # Init main inside region by dense voxels
+     init_n_level = 6,  # (2^6)^3 voxels
+ 
++    # Inside-region allocation strategy.
++    #   uniform : dense (2^init_n_level)^3 grid, visibility-filtered (default).
++    #   seeded  : allocate only voxels containing seed points (LiDAR/fused
++    #             depth back-projection), dilated by seed_dilate voxels.
++    init_mode = "uniform",
++    seed_path = "",      # .npy [N,3] float32 world-frame points (meters)
++    seed_dilate = 1,     # neighborhood dilation radius in voxels at init level
++
+     # Init background outside region by different strategies.
+     #   none        : no voxels in outside region.
+     #   uniform[N]  : subdivide each shell level by N times.
 diff --git a/src/dataloader/colmap_loader.py b/src/dataloader/colmap_loader.py
 index 198eb93..d41af1e 100644
 --- a/src/dataloader/colmap_loader.py
@@ -279,7 +273,7 @@ index 198eb93..d41af1e 100644
  
  def storePly(path, xyz, rgb):
 diff --git a/src/dataloader/data_pack.py b/src/dataloader/data_pack.py
-index c583acb..1959923 100644
+index c583acb..0cec557 100644
 --- a/src/dataloader/data_pack.py
 +++ b/src/dataloader/data_pack.py
 @@ -206,7 +206,7 @@ def instantiate_a_camera(cam_info, cfg_data, dataset_downscale):
@@ -311,6 +305,32 @@ index c583acb..1959923 100644
      # Load depth if exist
      depth = None
      if cam_info.depth is not None:
+@@ -247,14 +260,17 @@ def instantiate_a_camera(cam_info, cfg_data, dataset_downscale):
+         depth = torch.tensor(np.array(pil_depth) / cfg_data.depth_scale, dtype=torch.float32)
+         depth = depth.unsqueeze(0).contiguous()
+ 
+-    return Camera(w2c=cam_info.w2c,
+-                  fovx=cam_info.fovx, fovy=cam_info.fovy,
+-                  cx_p=cam_info.cx_p, cy_p=cam_info.cy_p,
+-                  R=cam_info.R, T=cam_info.T,
+-                  image=gt_image, mask=mask, depth=depth,
+-                  sparse_pt=cam_info.sparse_pt,
+-                  ncc_scale=ncc_scale,
+-                  image_name=cam_info.image_name)
++    camera = Camera(w2c=cam_info.w2c,
++                    fovx=cam_info.fovx, fovy=cam_info.fovy,
++                    cx_p=cam_info.cx_p, cy_p=cam_info.cy_p,
++                    R=cam_info.R, T=cam_info.T,
++                    image=gt_image, mask=mask, depth=depth,
++                    sparse_pt=cam_info.sparse_pt,
++                    ncc_scale=ncc_scale,
++                    image_name=cam_info.image_name)
++    camera.lidar_depth = lidar_depth
++    camera.lidar_conf = lidar_conf
++    return camera
+ 
+ 
+ def instantiate_a_minicamera(cam_info, cfg_data, dataset_downscale=1):
 diff --git a/src/dataloader/reader_nerf_dataset.py b/src/dataloader/reader_nerf_dataset.py
 index 89dde7f..4c3bc3a 100644
 --- a/src/dataloader/reader_nerf_dataset.py
@@ -349,6 +369,107 @@ index 1e535be..1e6ee3f 100644
  
      sparse_pt: np.array = None
  
+diff --git a/src/sparse_voxel_gears/constructor.py b/src/sparse_voxel_gears/constructor.py
+index c2de40a..3922603 100644
+--- a/src/sparse_voxel_gears/constructor.py
++++ b/src/sparse_voxel_gears/constructor.py
+@@ -27,12 +27,22 @@ class SVConstructor:
+         # Init voxel layout.
+         # The world is seperated into inside (main foreground) and outside (background) regions.
+         init_inside_level = self.outside_level + cfg_init.init_n_level
+-        in_path, in_level, in_samp_rate = octlayout_inside_uniform(
+-            voxel_model=self,
+-            n_level=cfg_init.init_n_level,
+-            cameras=cameras,
+-            filter_zero_visiblity=True,
+-            filter_near=-1)
++        if getattr(cfg_init, "init_mode", "uniform") == "seeded":
++            in_path, in_level, in_samp_rate = octlayout_inside_seeded(
++                voxel_model=self,
++                seed_path=cfg_init.seed_path,
++                n_level=cfg_init.init_n_level,
++                dilate=cfg_init.seed_dilate,
++                cameras=cameras,
++                filter_zero_visiblity=True,
++                filter_near=-1)
++        else:
++            in_path, in_level, in_samp_rate = octlayout_inside_uniform(
++                voxel_model=self,
++                n_level=cfg_init.init_n_level,
++                cameras=cameras,
++                filter_zero_visiblity=True,
++                filter_near=-1)
+ 
+         if cfg_init.outside_mode == "none" or self.outside_level == 0:
+             # Object centric bounded scenes
+@@ -178,6 +188,67 @@ def octlayout_inside_uniform(voxel_model, n_level, cameras=None, samp_mode="max"
+     return octpath, octlevel, avg_rate
+ 
+ 
++def octlayout_inside_seeded(voxel_model, seed_path, n_level, dilate=1, cameras=None, samp_mode="max", filter_zero_visiblity=True, filter_near=-1):
++    '''
++    Allocate inside-region voxels only where seed points live (LiDAR / fused
++    depth back-projection), instead of a dense uniform grid. Seeds are Morton-
++    encoded at the same final level as the uniform init
++    (outside_level + n_level), deduplicated, then dilated by `dilate` voxels
++    (26-neighborhood) to close sensor gaps before visibility filtering.
++    '''
++    assert seed_path, "cfg.init.seed_path required for init_mode=seeded"
++    lv = voxel_model.outside_level + n_level
++    pts = torch.from_numpy(np.load(seed_path).astype(np.float32)).cuda()
++
++    inside_min = voxel_model.scene_center - 0.5 * voxel_model.inside_extent
++    inside_max = voxel_model.scene_center + 0.5 * voxel_model.inside_extent
++    eps = 1e-5 * voxel_model.inside_extent
++    ok = ((pts > inside_min + eps) & (pts < inside_max - eps)).all(-1)
++    print(f"Seeded init: {len(pts)} seeds, {ok.sum().item()} inside main region")
++    pts = pts[ok]
++    assert len(pts) > 0, "no seed points inside the main region"
++
++    octlevel = torch.full([len(pts), 1], lv, dtype=torch.int8, device="cuda")
++    octpath = octree_utils.xyz_2_octpath(
++        pts, octlevel, voxel_model.scene_center, voxel_model.scene_extent)
++    octpath = octpath.reshape(-1, 1).unique().reshape(-1, 1)
++    n_occupied = len(octpath)
++
++    if dilate > 0:
++        octlevel = torch.full([len(octpath), 1], lv, dtype=torch.int8, device="cuda")
++        ijk = svraster_cuda.utils.octpath_2_ijk(octpath, octlevel)
++        r = torch.arange(-dilate, dilate + 1, dtype=torch.int64, device="cuda")
++        off = torch.stack(torch.meshgrid(r, r, r, indexing="ij"), -1).reshape(-1, 3)
++        ijk = (ijk.view(-1, 1, 3) + off).reshape(-1, 3)
++        # only voxels fully inside the main region survive the clamp
++        lo = ((inside_min - (voxel_model.scene_center - 0.5 * voxel_model.scene_extent))
++              / level_2_vox_size_scalar(voxel_model.scene_extent, lv)).round().long()
++        n_inside = 1 << n_level
++        ijk = ijk[((ijk >= lo) & (ijk < lo + n_inside)).all(-1)]
++        ijk = ijk.unique(dim=0)
++        octlevel = torch.full([len(ijk), 1], lv, dtype=torch.int8, device="cuda")
++        octpath = svraster_cuda.utils.ijk_2_octpath(ijk, octlevel)
++
++    octpath = octpath.reshape(-1, 1)
++    octlevel = torch.full([len(octpath), 1], lv, dtype=torch.int8, device="cuda")
++    print(f"Seeded init: {n_occupied} occupied -> {len(octpath)} after dilate={dilate} "
++          f"(uniform grid would be {(2**n_level)**3})")
++
++    octpath, octlevel, avg_rate = octlayout_filtering(
++        octpath=octpath,
++        octlevel=octlevel,
++        voxel_model=voxel_model,
++        cameras=cameras,
++        samp_mode=samp_mode,
++        filter_zero_visiblity=filter_zero_visiblity,
++        filter_near=filter_near)
++    return octpath, octlevel, avg_rate
++
++
++def level_2_vox_size_scalar(scene_extent, lv):
++    return scene_extent * (2.0 ** -lv)
++
++
+ def octlayout_outside_uniform(voxel_model, n_level, cameras=None, samp_mode="max", filter_zero_visiblity=True, filter_near=-1):
+     octpath = []
+     octlevel = []
 diff --git a/src/utils/bounding_utils.py b/src/utils/bounding_utils.py
 index 9e8e41c..b593186 100644
 --- a/src/utils/bounding_utils.py
@@ -475,7 +596,7 @@ index f311360..691dec2 100644
  
  def vox_size_2_level(scene_extent, vox_size):
 diff --git a/train.py b/train.py
-index c2d5e33..9d66692 100644
+index c2d5e33..c79e78e 100644
 --- a/train.py
 +++ b/train.py
 @@ -72,6 +72,10 @@ def training(args):
@@ -489,7 +610,18 @@ index c2d5e33..9d66692 100644
      if cfg.regularizer.lambda_mast3r_metric_depth:
          mono_utils.prepare_mast3r_metric_depth(
              cameras=tr_cams,
-@@ -121,7 +125,7 @@ def training(args):
+@@ -105,6 +109,10 @@ def training(args):
+     voxel_model.optimizer_init(cfg.optimizer)
+     if loaded_iter and args.load_optimizer:
+         voxel_model.optimizer_load_iteration(loaded_iter)
++    # Defragment before the first optimizer step lazily allocates Adam state
++    # (large burst allocations are what trip the flaky eGPU driver).
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
+ 
+     # Init lr warmup scheduler
+     if first_iter <= cfg.optimizer.n_warmup:
+@@ -121,7 +129,7 @@ def training(args):
              cfg.procedure.subdivide_every
          )
      )
@@ -498,7 +630,15 @@ index c2d5e33..9d66692 100644
      subdivide_prop = max(0, (subdivide_scale - 1) / 7)
      print(f"Subdiv: times={remain_subdiv_times:2d} scale-each-time={subdivide_scale*100:.1f}% prop={subdivide_prop*100:.1f}%")
  
-@@ -209,11 +213,12 @@ def training(args):
+@@ -181,6 +189,7 @@ def training(args):
+     ema_pixel_for_log = 0.0
+     ema_photo_for_log = 0.0
+     ema_depth_for_log = 0.0
++    ema_lidar_for_log = 0.0
+     iter_rng = range(first_iter, cfg.procedure.n_iter+1)
+     progress_bar = tqdm(iter_rng, desc="Training", ascii=True)
+     for iteration in iter_rng:
+@@ -209,13 +218,14 @@ def training(args):
          need_sparse_depth = cfg.regularizer.lambda_sparse_depth > 0 and sparse_depth_loss.is_active(iteration)
          need_depthanythingv2 = cfg.regularizer.lambda_depthanythingv2 > 0 and depthanythingv2_loss.is_active(iteration)
          need_mast3r_metric_depth = cfg.regularizer.lambda_mast3r_metric_depth > 0 and mast3r_metric_depth_loss.is_active(iteration)
@@ -510,36 +650,41 @@ index c2d5e33..9d66692 100644
 -        tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_level_uncertainty
 +        tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_lidar_depth or need_level_uncertainty
          tr_render_opt['output_normal'] = need_nd_loss or need_nmed_loss or iteration > cfg.regularizer.multi_view_weight_from_iter
-         tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or iteration > cfg.regularizer.multi_view_weight_from_iter
+-        tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or iteration > cfg.regularizer.multi_view_weight_from_iter
++        tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_lidar_depth or iteration > cfg.regularizer.multi_view_weight_from_iter
          # tr_render_opt['output_depth'] = True
-@@ -277,6 +282,8 @@ def training(args):
+ 
+         if iteration >= cfg.regularizer.dist_from and cfg.regularizer.lambda_dist:
+@@ -277,6 +287,11 @@ def training(args):
  
          if need_mast3r_metric_depth:
              loss += cfg.regularizer.lambda_mast3r_metric_depth * mast3r_metric_depth_loss(cam, render_pkg, iteration)
 +        if need_lidar_depth:
-+            loss += cfg.regularizer.lambda_lidar_depth * lidar_depth_loss(cam, render_pkg, iteration)
++            lidar_loss_val = lidar_depth_loss(cam, render_pkg, iteration)
++            loss += cfg.regularizer.lambda_lidar_depth * lidar_loss_val
++        else:
++            lidar_loss_val = None
  
          if cfg.regularizer.lambda_ssim:
              loss += cfg.regularizer.lambda_ssim * loss_utils.fast_ssim_loss(render_image, gt_image)
--- 
-2.53.0
-
-
-From 24ffd11847fa03ad36b75449b529c0d3b9ddf560 Mon Sep 17 00:00:00 2001
-From: ken001111 <ken001111@users.noreply.github.com>
-Date: Wed, 8 Jul 2026 12:39:49 -0500
-Subject: [PATCH 2/3] guard mono-prior visualization when priors absent
- (lidar-only runs)
-
----
- train.py | 13 ++++++++-----
- 1 file changed, 8 insertions(+), 5 deletions(-)
-
-diff --git a/train.py b/train.py
-index 9d66692..069d4ef 100644
---- a/train.py
-+++ b/train.py
-@@ -733,11 +733,14 @@ def training_report(data_pack, voxel_model, iteration, loss, psnr, elapsed, ema_
+@@ -667,6 +682,8 @@ def training(args):
+             ema_pixel_for_log = 0.6 * ema_pixel_for_log + 0.4 * geo_loss.item()
+             ema_photo_for_log = 0.6 * ema_photo_for_log + 0.4 * photo_loss.item()
+             ema_depth_for_log = 0.6 * ema_depth_for_log + 0.4 * depth_loss.item()
++            if lidar_loss_val is not None:
++                ema_lidar_for_log = 0.6 * ema_lidar_for_log + 0.4 * float(lidar_loss_val)
+             if iteration % 10 == 0:
+                 pb_text = {
+                     "Loss": f"{ema_loss_for_log:.5f}",
+@@ -674,6 +691,7 @@ def training(args):
+                     "pixel": f"{ema_pixel_for_log:.4f}",
+                     "ncc": f"{ema_ncc_for_log:.4f}",
+                     # "depth": f"{ema_depth_for_log:.5f}",
++                    "lidar": f"{ema_lidar_for_log:.4f}",
+                     "psnr": f"{ema_psnr_for_log:.2f}",
+                 }
+                 progress_bar.set_postfix(pb_text)
+@@ -726,11 +744,14 @@ def training_report(data_pack, voxel_model, iteration, loss, psnr, elapsed, ema_
          
          render_normal_from_points = render_normal_func(view, render_depth.squeeze())
          render_normal_med_from_points = render_normal_func(view, render_depth_med.squeeze())
@@ -559,101 +704,3 @@ index 9d66692..069d4ef 100644
          
          render_vox_level = render_pkg['feat']/(1-render_pkg['T'][0]).clamp(min=0.1).squeeze().detach()
          level_weight = (render_vox_level.max()-render_vox_level.min())/(render_vox_level-render_vox_level.min()).clamp(min=1.0)
--- 
-2.53.0
-
-
-From 8f5a7099a841b70de980d4aa824bfa6ef577fa53 Mon Sep 17 00:00:00 2001
-From: ken001111 <ken001111@users.noreply.github.com>
-Date: Wed, 8 Jul 2026 12:48:44 -0500
-Subject: [PATCH 3/3] fix: actually attach lidar_depth/conf to Camera; request
- depth output; show lidar term in progress bar
-
----
- src/dataloader/data_pack.py | 19 +++++++++++--------
- train.py                    | 11 +++++++++--
- 2 files changed, 20 insertions(+), 10 deletions(-)
-
-diff --git a/src/dataloader/data_pack.py b/src/dataloader/data_pack.py
-index 1959923..0cec557 100644
---- a/src/dataloader/data_pack.py
-+++ b/src/dataloader/data_pack.py
-@@ -260,14 +260,17 @@ def instantiate_a_camera(cam_info, cfg_data, dataset_downscale):
-         depth = torch.tensor(np.array(pil_depth) / cfg_data.depth_scale, dtype=torch.float32)
-         depth = depth.unsqueeze(0).contiguous()
- 
--    return Camera(w2c=cam_info.w2c,
--                  fovx=cam_info.fovx, fovy=cam_info.fovy,
--                  cx_p=cam_info.cx_p, cy_p=cam_info.cy_p,
--                  R=cam_info.R, T=cam_info.T,
--                  image=gt_image, mask=mask, depth=depth,
--                  sparse_pt=cam_info.sparse_pt,
--                  ncc_scale=ncc_scale,
--                  image_name=cam_info.image_name)
-+    camera = Camera(w2c=cam_info.w2c,
-+                    fovx=cam_info.fovx, fovy=cam_info.fovy,
-+                    cx_p=cam_info.cx_p, cy_p=cam_info.cy_p,
-+                    R=cam_info.R, T=cam_info.T,
-+                    image=gt_image, mask=mask, depth=depth,
-+                    sparse_pt=cam_info.sparse_pt,
-+                    ncc_scale=ncc_scale,
-+                    image_name=cam_info.image_name)
-+    camera.lidar_depth = lidar_depth
-+    camera.lidar_conf = lidar_conf
-+    return camera
- 
- 
- def instantiate_a_minicamera(cam_info, cfg_data, dataset_downscale=1):
-diff --git a/train.py b/train.py
-index 069d4ef..b1234e0 100644
---- a/train.py
-+++ b/train.py
-@@ -185,6 +185,7 @@ def training(args):
-     ema_pixel_for_log = 0.0
-     ema_photo_for_log = 0.0
-     ema_depth_for_log = 0.0
-+    ema_lidar_for_log = 0.0
-     iter_rng = range(first_iter, cfg.procedure.n_iter+1)
-     progress_bar = tqdm(iter_rng, desc="Training", ascii=True)
-     for iteration in iter_rng:
-@@ -220,7 +221,7 @@ def training(args):
-         need_level_uncertainty = cfg.regularizer.power_level_uncertainty > 0 and iteration > cfg.regularizer.level_uncertainty_from
-         tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_lidar_depth or need_level_uncertainty
-         tr_render_opt['output_normal'] = need_nd_loss or need_nmed_loss or iteration > cfg.regularizer.multi_view_weight_from_iter
--        tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or iteration > cfg.regularizer.multi_view_weight_from_iter
-+        tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_lidar_depth or iteration > cfg.regularizer.multi_view_weight_from_iter
-         # tr_render_opt['output_depth'] = True
- 
-         if iteration >= cfg.regularizer.dist_from and cfg.regularizer.lambda_dist:
-@@ -283,7 +284,10 @@ def training(args):
-         if need_mast3r_metric_depth:
-             loss += cfg.regularizer.lambda_mast3r_metric_depth * mast3r_metric_depth_loss(cam, render_pkg, iteration)
-         if need_lidar_depth:
--            loss += cfg.regularizer.lambda_lidar_depth * lidar_depth_loss(cam, render_pkg, iteration)
-+            lidar_loss_val = lidar_depth_loss(cam, render_pkg, iteration)
-+            loss += cfg.regularizer.lambda_lidar_depth * lidar_loss_val
-+        else:
-+            lidar_loss_val = None
- 
-         if cfg.regularizer.lambda_ssim:
-             loss += cfg.regularizer.lambda_ssim * loss_utils.fast_ssim_loss(render_image, gt_image)
-@@ -674,6 +678,8 @@ def training(args):
-             ema_pixel_for_log = 0.6 * ema_pixel_for_log + 0.4 * geo_loss.item()
-             ema_photo_for_log = 0.6 * ema_photo_for_log + 0.4 * photo_loss.item()
-             ema_depth_for_log = 0.6 * ema_depth_for_log + 0.4 * depth_loss.item()
-+            if lidar_loss_val is not None:
-+                ema_lidar_for_log = 0.6 * ema_lidar_for_log + 0.4 * float(lidar_loss_val)
-             if iteration % 10 == 0:
-                 pb_text = {
-                     "Loss": f"{ema_loss_for_log:.5f}",
-@@ -681,6 +687,7 @@ def training(args):
-                     "pixel": f"{ema_pixel_for_log:.4f}",
-                     "ncc": f"{ema_ncc_for_log:.4f}",
-                     # "depth": f"{ema_depth_for_log:.5f}",
-+                    "lidar": f"{ema_lidar_for_log:.4f}",
-                     "psnr": f"{ema_psnr_for_log:.2f}",
-                 }
-                 progress_bar.set_postfix(pb_text)
--- 
-2.53.0
-
