@@ -70,7 +70,7 @@ gt_mm = np.asarray(gt_v.points) * 1000.0
 tree_gt = cKDTree(gt_mm)
 print(f"GT {len(g_all)} -> {len(gt_mm)} training-observed ({vis.mean():.2f})")
 
-for arm in ["nodepth", "mono", "lidar", "lidarconf", "fused"]:
+for arm in ["nodepth", "mono", "lidar", "lidarconf", "fused", "seeded"]:
     mesh_path = f"{ABLATION}/{arm}/mesh/tsdf/tsdf_fusion_post.ply"
     if not os.path.isfile(mesh_path):
         print(f"[{arm}] NO MESH - skip"); continue
